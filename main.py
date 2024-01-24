@@ -6,6 +6,7 @@ The clusters are output to a csv file and an xlsx file.
 The csv file is then used to create a txt file for each cluster.
 
 Instructions:
+Obtain the SNOMED databases from the NHS Digital TRUD website.
 Configure the paths to the databases and the output files.
 Configure the clusters dictionary with the clusters to create.
 """
