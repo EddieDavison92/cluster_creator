@@ -165,12 +165,13 @@ create_txt_files_from_csv(csv_filename, clusters_dir)
 end_time = datetime.datetime.now()
 execution_time = end_time - start_time
 total_seconds = execution_time.total_seconds()
-minutes = total_seconds // 60
-seconds = total_seconds % 60
+minutes = int(total_seconds // 60)
+seconds = int(total_seconds % 60) 
 
 if minutes > 0:
-    time_str = f"{minutes} minutes and {seconds:.1f} seconds"
+    time_str = f"{minutes} minutes and {seconds} seconds"
 else:
-    time_str = f"{seconds:.1f} seconds"
+    time_str = f"{seconds} seconds"
+
 
 logging.info(f"Script executed in {time_str}")
