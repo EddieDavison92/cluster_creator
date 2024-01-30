@@ -38,6 +38,7 @@ clusters_dir = 'clusters'
 # Dictionary of clusters to create
 clusters = {
     'dm_cod': [73211009],
+    'dmt1_cod': [46635009],
     'fh_cvd_cod': [266894000],
     'pain_cod': [276435006],
     'msk_cod': [106028002, 301366005, 421060004, 72696002, 106030000, 302258001, 302293008, 298339004, 298325004, 298343000],
