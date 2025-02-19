@@ -1,191 +1,202 @@
-"""
-This script creates clusters of SNOMED codes based on the transitive closure table in the SNOMED database.
-The clusters are created by specifying a list of parent codes and then finding all the child codes of those parents.
-The child codes are then converted to their current code if they have been retired.
-The clusters are output to a csv file and an xlsx file.
-The csv file is then used to create a txt file for each cluster.
-
-Instructions:
-Obtain the SNOMED databases from the NHS Digital TRUD website.
-Configure the paths to the databases and adjust output file paths if necessary.
-Configure the clusters dictionary with the clusters to create.
-"""
-
-import warnings
 import os
 import datetime
 import logging
+import warnings
 import pandas as pd
 import pyodbc
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.utils import get_column_letter
+from typing import Dict, Set, List
 
-# Suppress all UserWarning category warning to prevent pandas spam re; SQLAlchemy
+# Suppress UserWarnings (e.g. from pandas)
 warnings.simplefilter('ignore', category=UserWarning)
 
-# Setup logging and timer
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+# Set up logging to output to both the terminal and a log file (overwriting each run)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(message)s', '%Y-%m-%d %H:%M:%S')
+
+# File handler for log.txt (overwrites previous log)
+file_handler = logging.FileHandler("log.txt", mode='w')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Stream handler for terminal output
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
 start_time = datetime.datetime.now()
 
-# Configuration
-transitive_closure_db = r"C:\Users\eddie\NHS\HealtheAnalytics Workstream - LTC LCS Workstream\Product Specifications\Data modelling\DMWB NHS SNOMED Transitive Closure.mdb"
-history_db = r"C:\Users\eddie\NHS\HealtheAnalytics Workstream - LTC LCS Workstream\Product Specifications\Data modelling\DMWB NHS SNOMED History.mdb"
-snomed_db = r"C:\Users\eddie\NHS\HealtheAnalytics Workstream - LTC LCS Workstream\Product Specifications\Data modelling\DMWB NHS SNOMED.mdb"
-csv_filename = 'snomed_hierarchical_clusters.csv'
-xlsx_filename = 'snomed_hierarchical_clusters.xlsx'
-clusters_dir = 'clusters'
+# Database file paths – please adjust these paths as necessary.
+TRANSITIVE_CLOSURE_DB = r"C:\Users\eddie\Downloads\nhs_dmwb_39.0.0_20240925000001\DMWB NHS SNOMED Transitive Closure.mdb"
+HISTORY_DB = r"C:\Users\eddie\Downloads\nhs_dmwb_39.0.0_20240925000001\DMWB NHS SNOMED History.mdb"
 
-# Dictionary of clusters to create
-clusters = {
-    'dm_cod': [73211009],
-    'dmt1_cod': [46635009],
-    'fh_cvd_cod': [266894000],
-    'pain_cod': [276435006],
-    'msk_cod': [106028002, 301366005, 421060004, 72696002, 106030000, 302258001, 302293008, 298339004, 298325004, 298343000],
-}
+# Input and output filenames
+INPUT_CSV = "Cerner_UK_Clinical_Standard-12-02-2025.csv"
+OUTPUT_TABLE_CSV = "snomed_expanded_table.csv"
 
-def connect_to_db(db_path):
+def connect_to_db(db_path: str) -> pyodbc.Connection:
     conn_str = (
         r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
         r'DBQ=' + db_path + ';'
     )
     return pyodbc.connect(conn_str)
 
-def get_child_codes(parent_code, conn):
-    query = f"SELECT SubtypeID FROM SCTTC WHERE SuperTypeID = '{parent_code}'"
-    return pd.read_sql(query, conn)
+def load_transitive_closure_efficient(conn_transitive: pyodbc.Connection) -> Dict[str, Set[str]]:
+    """
+    Efficiently load the entire transitive closure table into a dictionary.
+    Each key is a SuperTypeID and the value is the set of SubtypeIDs.
+    """
+    logging.info("Loading transitive closure table into memory...")
+    trans_dict: Dict[str, Set[str]] = {}
+    cursor = conn_transitive.cursor()
+    cursor.execute("SELECT SuperTypeID, SubtypeID FROM SCTTC")
+    batch_size = 10000
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            super_code = str(row.SuperTypeID).strip()
+            sub_code = str(row.SubtypeID).strip()
+            if super_code not in trans_dict:
+                trans_dict[super_code] = set()
+            trans_dict[super_code].add(sub_code)
+    logging.info(f"Loaded transitive closure table with {len(trans_dict)} keys.")
+    return trans_dict
 
-def get_current_code(old_code, conn):
-    query = f"SELECT NEWCUI FROM SCTHIST WHERE OLDCUI = '{old_code}'"
-    return pd.read_sql(query, conn)
+def load_history_table_efficient(conn_history: pyodbc.Connection) -> Dict[str, Set[str]]:
+    """
+    Efficiently load the entire history table into a dictionary.
+    Each key is an OLDCUI and the value is the set of NEWCUI values.
+    """
+    logging.info("Loading history table into memory...")
+    history_dict: Dict[str, Set[str]] = {}
+    cursor = conn_history.cursor()
+    cursor.execute("SELECT OLDCUI, NEWCUI FROM SCTHIST")
+    batch_size = 10000
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            old_code = str(row.OLDCUI).strip()
+            new_code = str(row.NEWCUI).strip()
+            if old_code not in history_dict:
+                history_dict[old_code] = set()
+            history_dict[old_code].add(new_code)
+    logging.info(f"Loaded history table with {len(history_dict)} keys.")
+    return history_dict
 
-def get_term_for_code(code, conn):
-    query = f"SELECT TERM FROM SCT WHERE CUI = '{code}'"
-    return pd.read_sql(query, conn)
+def expand_codes_for_concept(code: str,
+                             history_dict: Dict[str, Set[str]],
+                             trans_dict: Dict[str, Set[str]]) -> Set[str]:
+    """
+    Expand a given SNOMED code by including any history replacements and recursively
+    finding all child codes (and their history replacements). Both the original and any
+    replacement codes are used as expansion points.
+    """
+    # Start with the original code and its history replacements (if any)
+    base_set: Set[str] = {code} | history_dict.get(code, set())
+    expanded_codes: Set[str] = set(base_set)
+    to_process: Set[str] = set(base_set)
 
-def chunk_list(lst, size):
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
+    while to_process:
+        new_codes: Set[str] = set()
+        for current_code in to_process:
+            children = trans_dict.get(current_code, set())
+            for child in children:
+                child_replacements = history_dict.get(child, set())
+                new_codes.add(child)
+                new_codes |= child_replacements
+        new_codes -= expanded_codes
+        if not new_codes:
+            break
+        expanded_codes |= new_codes
+        to_process = new_codes
+    return expanded_codes
 
-def fetch_all_child_codes(parent_codes, conn_transitive, conn_history, conn_snomed, exceptions=None):
-    if exceptions is None:
-        exceptions = set()
+def process_csv_to_table(input_csv: str, output_csv: str,
+                         history_dict: Dict[str, Set[str]],
+                         trans_dict: Dict[str, Set[str]]) -> None:
+    """
+    Read the input CSV, filter for rows where Code System is 'SNOMED CT',
+    expand the SNOMED codes for each cluster (using the 'Aliases' field as cluster ID),
+    and then write a new CSV file in a compact table format with two columns:
+    'Cluster ID' and 'Code'.
+    
+    Additionally, log for each cluster:
+      - the original count (base set count)
+      - the number of new codes added (difference between final and original)
+      - the final total count.
+    """
+    logging.info(f"Reading input CSV file '{input_csv}'.")
+    df = pd.read_csv(input_csv, dtype=str)
+    # Filter for rows where Code System is SNOMED CT
+    snomed_mask = df["Code System"].str.upper() == "SNOMED CT"
+    df_snomed = df[snomed_mask]
 
-    all_codes = set(parent_codes)
-    newly_added = set(parent_codes)
+    unique_clusters = df_snomed["Aliases"].unique()
+    logging.info(f"Found {len(unique_clusters)} unique cluster IDs to process.")
 
-    while newly_added:
-        temp_new_children = set()
-        for chunk in chunk_list(list(newly_added), 500):
-            query = "SELECT SubtypeID FROM SCTTC WHERE SuperTypeID IN ({})".format(",".join(['?'] * len(chunk)))
-            cursor = conn_transitive.cursor()
-            cursor.execute(query, chunk)
-            temp_new_children.update({row.SubtypeID for row in cursor.fetchall()})
+    output_rows: List[Dict[str, str]] = []
+    
+    for cluster_id in unique_clusters:
+        cluster_rows = df_snomed[df_snomed["Aliases"] == cluster_id]
+        base_code = cluster_rows.iloc[0]["Code"]
+        if not base_code or pd.isna(base_code):
+            logging.warning(f"Cluster '{cluster_id}' has no base code; skipping.")
+            continue
 
-        newly_added = temp_new_children - all_codes
-        newly_added -= exceptions
-        all_codes.update(newly_added)
+        base_code = base_code.strip()
+        # Compute base set: the original code plus any immediate history replacements
+        base_set: Set[str] = {base_code} | history_dict.get(base_code, set())
+        base_count = len(base_set)
+        
+        try:
+            expanded = expand_codes_for_concept(base_code, history_dict, trans_dict)
+            final_count = len(expanded)
+            added = final_count - base_count
+            logging.info(f"Cluster '{cluster_id}': original count = {base_count}, added = {added}, new total = {final_count} codes.")
+            for code in sorted(expanded):
+                output_rows.append({"Cluster ID": cluster_id, "Code": code})
+        except Exception as e:
+            logging.error(f"Error expanding cluster '{cluster_id}': {e}")
 
-    # Convert old codes to current codes and filter duplicates
-    final_codes = set()
-    for code in all_codes:
-        current_code = get_current_code(code, conn_history)
-        if not current_code.empty:
-            code = current_code.iloc[0]['NEWCUI']
+    df_output = pd.DataFrame(output_rows)
+    df_output.to_csv(output_csv, index=False, encoding='utf-8-sig')
+    logging.info(f"Expanded table CSV file '{output_csv}' created with {len(df_output)} rows.")
 
-        final_codes.add(code)
+def main() -> None:
+    try:
+        conn_transitive = connect_to_db(TRANSITIVE_CLOSURE_DB)
+        conn_history = connect_to_db(HISTORY_DB)
+        logging.info("Database connections opened successfully.")
+    except Exception as e:
+        logging.error(f"Error connecting to databases: {e}")
+        return
 
-    return final_codes
+    try:
+        trans_dict = load_transitive_closure_efficient(conn_transitive)
+        history_dict = load_history_table_efficient(conn_history)
+    except Exception as e:
+        logging.error(f"Error loading tables: {e}")
+        conn_transitive.close()
+        conn_history.close()
+        return
 
-def output_to_csv(cluster_dict, filename):
-    conn_transitive = connect_to_db(transitive_closure_db)
-    conn_history = connect_to_db(history_db)
-    conn_snomed = connect_to_db(snomed_db)
-
-    all_child_codes = []
-    total_codes_count = 0
-
-    for cluster_id, parent_codes in cluster_dict.items():
-        child_codes = fetch_all_child_codes(parent_codes, conn_transitive, conn_history, conn_snomed)
-        codes_count = len(child_codes)
-        total_codes_count += codes_count
-        for code in child_codes:
-            term = get_term_for_code(code, conn_snomed)
-            term_value = term.iloc[0]['TERM'] if not term.empty else 'Unknown'
-            all_child_codes.append((cluster_id, str(code), term_value))
-        logging.info(f"Cluster '{cluster_id}' created with {codes_count} codes.")
-
-    df = pd.DataFrame(all_child_codes, columns=['Cluster ID', 'Concept ID', 'Term'])
-
-    df.to_csv(filename, index=False, encoding='utf-8-sig')
+    process_csv_to_table(INPUT_CSV, OUTPUT_TABLE_CSV, history_dict, trans_dict)
 
     conn_transitive.close()
     conn_history.close()
-    conn_snomed.close()
+    logging.info("Database connections closed.")
 
-    logging.info (f"Completed creating clusters with {total_codes_count} total codes across {len(cluster_dict)} clusters.")
-    logging.info(f"Csv file '{filename}' created.")
+    end_time = datetime.datetime.now()
+    execution_time = end_time - start_time
+    total_seconds = execution_time.total_seconds()
+    minutes = int(total_seconds // 60)
+    seconds = int(total_seconds % 60)
+    time_str = f"{minutes} minutes and {seconds} seconds" if minutes > 0 else f"{seconds} seconds"
+    logging.info(f"Script executed in {time_str}")
 
-
-def create_xlsx_from_csv(csv_file, xlsx_file):
-    df = pd.read_csv(csv_file, dtype={'Concept ID': str})
-
-    with pd.ExcelWriter(xlsx_file, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Clusters')
-
-        workbook = writer.book
-        worksheet = writer.sheets['Clusters']
-
-        # Set Concept ID format to text
-        for row in worksheet.iter_rows(min_row=2, max_col=2, max_row=worksheet.max_row):
-            for cell in row:
-                cell.number_format = '@'
-
-        # Create a table over the data range
-        max_column = get_column_letter(worksheet.max_column)
-        data_range = f"A1:{max_column}{worksheet.max_row}"
-        table = Table(displayName="ClusterTable", ref=data_range)
-
-        # Add default table style
-        style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
-                               showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-        table.tableStyleInfo = style
-        worksheet.add_table(table)
-
-    logging.info(f"Xlsx file '{xlsx_file}' created.")
-
-def create_txt_files_from_csv(csv_filename, output_dir):
-    # Read the CSV file
-    df = pd.read_csv(csv_filename)
-
-    # Create the output directory if it doesn't exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Group by 'Cluster ID' and save each group to a .txt file
-    for cluster_id, group in df.groupby('Cluster ID'):
-        txt_filename = os.path.join(output_dir, f"{cluster_id}.txt")
-        with open(txt_filename, 'w') as f:
-            formatted_codes = ','.join([f"'{code}'" for code in group['Concept ID']])
-            f.write(formatted_codes)
-        logging.info(f"Txt file '{txt_filename}' created.")
-
-# Main script execution
-logging.info("Script started. Found {}".format(len(clusters)) + " clusters to create.")
-output_to_csv(clusters, csv_filename)
-create_xlsx_from_csv(csv_filename, xlsx_filename)
-create_txt_files_from_csv(csv_filename, clusters_dir)
-
-end_time = datetime.datetime.now()
-execution_time = end_time - start_time
-total_seconds = execution_time.total_seconds()
-minutes = int(total_seconds // 60)
-seconds = int(total_seconds % 60) 
-
-if minutes > 0:
-    time_str = f"{minutes} minutes and {seconds} seconds"
-else:
-    time_str = f"{seconds} seconds"
-
-
-logging.info(f"Script executed in {time_str}")
+if __name__ == "__main__":
+    main()
