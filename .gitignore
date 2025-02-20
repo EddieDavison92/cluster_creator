@@ -2,3 +2,5 @@ env/
 clusters/
 snomed_hierarchical_clusters.csv
 snomed_hierarchical_clusters.xlsx
+Cerner_UK_Clinical_Standard-12-02-2025.csv
+snomed_expanded_table.csv
