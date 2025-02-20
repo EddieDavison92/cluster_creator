@@ -117,17 +117,15 @@ def expand_codes_for_concept(code: str,
 
 def process_csv_to_table(input_csv: str, output_csv: str,
                          history_dict: Dict[str, Set[str]],
-                         trans_dict: Dict[str, Set[str]]) -> None:
+                         trans_dict: Dict[str, Set[str]]) -> tuple[int, int, int]:
     """
     Read the input CSV, filter for rows where Code System is 'SNOMED CT',
     expand the SNOMED codes for each cluster (using the 'Aliases' field as cluster ID),
     and then write a new CSV file in a compact table format with two columns:
     'Cluster ID' and 'Code'.
     
-    Additionally, log for each cluster:
-      - the original count (base set count)
-      - the number of new codes added (difference between final and original)
-      - the final total count.
+    Returns:
+        tuple containing (initial_count, added_count, final_count)
     """
     logging.info(f"Reading input CSV file '{input_csv}'.")
     df = pd.read_csv(input_csv, dtype=str)
@@ -135,10 +133,15 @@ def process_csv_to_table(input_csv: str, output_csv: str,
     snomed_mask = df["Code System"].str.upper() == "SNOMED CT"
     df_snomed = df[snomed_mask]
 
+    # Count total initial unique SNOMED codes
+    total_initial_codes = len(df_snomed["Code"].dropna().unique())
+    logging.info(f"Initial unique SNOMED codes: {total_initial_codes}")
+
     unique_clusters = df_snomed["Aliases"].unique()
     logging.info(f"Found {len(unique_clusters)} unique cluster IDs to process.")
 
     output_rows: List[Dict[str, str]] = []
+    total_final_codes = 0
     
     for cluster_id in unique_clusters:
         cluster_rows = df_snomed[df_snomed["Aliases"] == cluster_id]
@@ -148,15 +151,11 @@ def process_csv_to_table(input_csv: str, output_csv: str,
             continue
 
         base_code = base_code.strip()
-        # Compute base set: the original code plus any immediate history replacements
-        base_set: Set[str] = {base_code} | history_dict.get(base_code, set())
-        base_count = len(base_set)
-        
         try:
             expanded = expand_codes_for_concept(base_code, history_dict, trans_dict)
             final_count = len(expanded)
-            added = final_count - base_count
-            logging.info(f"Cluster '{cluster_id}': original count = {base_count}, added = {added}, new total = {final_count} codes.")
+            total_final_codes += final_count
+            logging.info(f"Cluster '{cluster_id}': expanded to {final_count} codes.")
             for code in sorted(expanded):
                 output_rows.append({"Cluster ID": cluster_id, "Code": code})
         except Exception as e:
@@ -165,6 +164,8 @@ def process_csv_to_table(input_csv: str, output_csv: str,
     df_output = pd.DataFrame(output_rows)
     df_output.to_csv(output_csv, index=False, encoding='utf-8-sig')
     logging.info(f"Expanded table CSV file '{output_csv}' created with {len(df_output)} rows.")
+    
+    return total_initial_codes, total_final_codes - total_initial_codes, total_final_codes
 
 def main() -> None:
     try:
@@ -184,7 +185,7 @@ def main() -> None:
         conn_history.close()
         return
 
-    process_csv_to_table(INPUT_CSV, OUTPUT_TABLE_CSV, history_dict, trans_dict)
+    initial_codes, added_codes, final_codes = process_csv_to_table(INPUT_CSV, OUTPUT_TABLE_CSV, history_dict, trans_dict)
 
     conn_transitive.close()
     conn_history.close()
@@ -197,6 +198,7 @@ def main() -> None:
     seconds = int(total_seconds % 60)
     time_str = f"{minutes} minutes and {seconds} seconds" if minutes > 0 else f"{seconds} seconds"
     logging.info(f"Script executed in {time_str}")
+    logging.info(f"Code expansion summary: {initial_codes} initial codes + {added_codes} added codes = {final_codes} total codes")
 
 if __name__ == "__main__":
     main()
